@@ -4,8 +4,6 @@ from bs4 import BeautifulSoup
 import re
 import json
 import io
-import os
-import time
 import zipfile
 from google import genai
 from google.genai import types
@@ -15,8 +13,12 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RL
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
+# DEBE IR ANTES QUE CUALQUIER OTRA COSA EN STREAMLIT
 st.set_page_config(page_title="Generador de Fichas PDF", page_icon="📄", layout="centered")
 
+import os
+
+# Lee la clave desde Streamlit Secrets o variables de entorno de forma segura
 API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
 # ==========================================
@@ -95,7 +97,7 @@ def extraer_datos_inmueble(url):
     return og_title, og_desc, body_text, imagenes
 
 # ==========================================
-# PROCESAMIENTO CON GEMINI (CON FALLBACK Y REINTENTOS)
+# PROCESAMIENTO CON GEMINI
 # ==========================================
 
 def procesar_con_ia(url, og_title, og_desc, body_text):
@@ -130,26 +132,14 @@ def procesar_con_ia(url, og_title, og_desc, body_text):
     }}
     """
 
-    modelos_candidatos = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash']
-    ultimo_error = None
-
-    for modelo in modelos_candidatos:
-        for intento in range(2):
-            try:
-                res = client.models.generate_content(
-                    model=modelo,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
-                )
-                return json.loads(res.text)
-            except Exception as e:
-                ultimo_error = e
-                time.sleep(2)
-                continue
-
-    raise ultimo_error
+    res = client.models.generate_content(
+        model='gemini-3.8-flash',
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json"
+        )
+    )
+    return json.loads(res.text)
 
 # ==========================================
 # RENDERIZADO DEL PDF
@@ -343,4 +333,112 @@ st.title("📄 Generador de Fichas en PDF")
 st.write("Pega hasta **5 enlaces** de Next Bienes Raíces (uno por línea):")
 
 if "fichas_generadas" not in st.session_state:
-    st.session_state.
+    st.session_state.fichas_generadas = []
+if "zip_buffer" not in st.session_state:
+    st.session_state.zip_buffer = None
+
+urls_raw = st.text_area(
+    "Enlaces de las propiedades:",
+    value="https://nextbr.mx/propiedades/casa-en-renta-en-torreplata-residencial\nhttps://nextbr.mx/propiedades/local-en-renta-en-col-san-benito-34737\nhttps://nextbr.mx/propiedades/casa-en-renta-en-corceles-residencial-34739",
+    height=130
+)
+
+col1, col2 = st.columns(2)
+with col1:
+    asesor_nombre = st.text_input("Tu Nombre:", value="Cristian Sosa")
+with col2:
+    asesor_wa = st.text_input("WhatsApp (10 dígitos):", value="6622057331")
+
+st.markdown("---")
+btn_generar = st.button("🚀 Iniciar Generación de PDFs", type="primary", use_container_width=True)
+
+if btn_generar:
+    lista_urls = [u.strip() for u in urls_raw.strip().split("\n") if u.strip().startswith("http")]
+    
+    if not lista_urls:
+        st.error("Pega al menos un enlace válido.")
+    else:
+        if len(lista_urls) > 5:
+            st.warning("Se procesarán los primeros 5 enlaces.")
+            lista_urls = lista_urls[:5]
+        
+        st.session_state.fichas_generadas = []
+        st.session_state.zip_buffer = None
+
+        barra = st.progress(0)
+        total = len(lista_urls)
+
+        for idx, url in enumerate(lista_urls):
+            with st.spinner(f"Procesando {idx + 1} de {total}: {url.split('/')[-1]}..."):
+                try:
+                    og_title, og_desc, body_text, fotos = extraer_datos_inmueble(url)
+                    info = procesar_con_ia(url, og_title, og_desc, body_text)
+
+                    titulo = info.get("titulo", "Propiedad Inmobiliaria")
+                    precio = info.get("precio", "")
+                    tags = info.get("caracteristicas", [])
+                    desc_final = info.get("descripcion", "")
+                    
+                    nombre_base = info.get("nombre_archivo", titulo)
+                    nombre_limpio = re.sub(r'[\\/*?:"<>|]', "", nombre_base).strip()
+                    nombre_pdf = f"{nombre_limpio}.pdf"
+
+                    pdf_data = generar_pdf(
+                        titulo=titulo,
+                        precio=precio,
+                        caracteristicas=tags,
+                        descripcion=desc_final,
+                        imagenes_urls=fotos,
+                        asesor_nom=asesor_nombre,
+                        asesor_tel=asesor_wa
+                    )
+
+                    st.session_state.fichas_generadas.append({
+                        "nombre": nombre_pdf,
+                        "datos": pdf_data,
+                        "fotos_count": len(fotos)
+                    })
+
+                except Exception as e:
+                    st.error(f"Error en {url}: {e}")
+
+            barra.progress((idx + 1) / total)
+
+        if st.session_state.fichas_generadas:
+            zip_io = io.BytesIO()
+            with zipfile.ZipFile(zip_io, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for item in st.session_state.fichas_generadas:
+                    zf.writestr(item["nombre"], item["datos"])
+            zip_io.seek(0)
+            st.session_state.zip_buffer = zip_io.getvalue()
+            st.balloons()
+
+if st.session_state.fichas_generadas:
+    st.subheader("🎉 Fichas Listas")
+    
+    if st.session_state.zip_buffer:
+        st.download_button(
+            label="📦 Descargar TODAS las fichas en un archivo ZIP",
+            data=st.session_state.zip_buffer,
+            file_name="Fichas_Inmobiliarias.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+    st.markdown("---")
+    st.write("**O descárgalas individualmente si prefieres:**")
+    
+    for i, ficha in enumerate(st.session_state.fichas_generadas):
+        col_txt, col_btn = st.columns([3, 2])
+        with col_txt:
+            st.write(f"📄 **{ficha['nombre']}** ({ficha['fotos_count']} fotos)")
+        with col_btn:
+            st.download_button(
+                label=f"📥 Descargar PDF",
+                data=ficha["datos"],
+                file_name=ficha["nombre"],
+                mime="application/pdf",
+                key=f"dl_persist_{i}",
+                use_container_width=True
+            )
