@@ -34,7 +34,7 @@ ASESORES = {
     "Claudia Castro": {
         "telefono": "6621387957",
         "foto": "claudia_castro.jpg",
-        "lema": "Conectamos personas con los espacios que sueñan."
+        "lema": "Tu tranquilidad es nuestra prioridad: nos encargamos de todo."
     }
 }
 
