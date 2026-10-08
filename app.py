@@ -7,6 +7,7 @@ import io
 import os
 import time
 import zipfile
+from PIL import Image as PILImage
 from google import genai
 from google.genai import types
 
@@ -19,7 +20,6 @@ st.set_page_config(page_title="Generador de Fichas PDF", page_icon="📄", layou
 
 API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
-# Directorio de asesores (aquí puedes añadir más fácilmente en el futuro)
 ASESORES = {
     "Cristian Sosa": "6622057331",
     "Claudia Castro": "6621387957"
@@ -168,6 +168,32 @@ def procesar_con_ia(url, og_title, og_desc, body_text):
     raise ultimo_error
 
 # ==========================================
+# ESCALADO DE IMÁGENES PROPORCIONAL
+# ==========================================
+
+def procesar_imagen_proporcional(url, max_w=540, max_h=320):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code == 200:
+            img_bytes = io.BytesIO(r.content)
+            with PILImage.open(img_bytes) as pil_img:
+                orig_w, orig_h = pil_img.size
+            
+            if orig_w == 0 or orig_h == 0:
+                return None
+            
+            ratio = min(max_w / orig_w, max_h / orig_h)
+            new_w = orig_w * ratio
+            new_h = orig_h * ratio
+            
+            img_bytes.seek(0)
+            return RLImage(img_bytes, width=new_w, height=new_h)
+    except Exception:
+        return None
+    return None
+
+# ==========================================
 # RENDERIZADO DEL PDF
 # ==========================================
 
@@ -251,30 +277,24 @@ def generar_pdf(titulo, precio, caracteristicas, descripcion, imagenes_urls, ase
 
     elementos = []
 
+    # 1. Título y Precio
     elementos.append(Paragraph(titulo, title_style))
     elementos.append(Spacer(1, 4))
     if precio:
         elementos.append(Paragraph(precio, price_style))
     elementos.append(Spacer(1, 8))
 
+    # 2. Descarga de fotos con tamaño proporcional respetando aspect ratio
     fotos_descargadas = []
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for url in imagenes_urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=8)
-            if r.status_code == 200:
-                img_data = io.BytesIO(r.content)
-                img = RLImage(img_data, width=265, height=170)
-                fotos_descargadas.append(img)
-        except Exception:
-            continue
+    for u in imagenes_urls:
+        rl_img = procesar_imagen_proporcional(u, max_w=540, max_h=300)
+        if rl_img:
+            fotos_descargadas.append(rl_img)
 
+    # 3. Portada: Solo 1 foto principal arriba y centrada
     if fotos_descargadas:
-        primeras = fotos_descargadas[:2]
-        if len(primeras) == 2:
-            t_front = Table([[primeras[0], primeras[1]]], colWidths=[270, 270])
-        else:
-            t_front = Table([[primeras[0]]], colWidths=[540])
+        foto_portada = fotos_descargadas[0]
+        t_front = Table([[foto_portada]], colWidths=[540])
         t_front.setStyle(TableStyle([
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
@@ -284,6 +304,7 @@ def generar_pdf(titulo, precio, caracteristicas, descripcion, imagenes_urls, ase
         elementos.append(t_front)
         elementos.append(Spacer(1, 8))
 
+    # 4. Badges de características
     if caracteristicas:
         badges = [Paragraph(f"✓ {c}", badge_style) for c in caracteristicas[:4]]
         t_badges = Table([badges], colWidths=[135] * len(badges))
@@ -299,6 +320,7 @@ def generar_pdf(titulo, precio, caracteristicas, descripcion, imagenes_urls, ase
         elementos.append(t_badges)
         elementos.append(Spacer(1, 10))
 
+    # 5. Descripción renglón por renglón
     lineas = [l.strip() for l in descripcion.split("\n") if l.strip()]
     for linea in lineas:
         if linea.endswith(":") or (not linea.startswith("•") and not linea.startswith("-")):
@@ -310,6 +332,7 @@ def generar_pdf(titulo, precio, caracteristicas, descripcion, imagenes_urls, ase
 
     elementos.append(Spacer(1, 14))
 
+    # 6. Botón de WhatsApp
     wa_url = f"https://wa.me/52{asesor_tel}?text=Hola%20{asesor_nom},%20me%20interesa%20esta%20propiedad:%20{titulo}"
     btn_link = f'<a href="{wa_url}" color="white">📲 Contactar a {asesor_nom} por WhatsApp ({asesor_tel})</a>'
     
@@ -323,28 +346,25 @@ def generar_pdf(titulo, precio, caracteristicas, descripcion, imagenes_urls, ase
     ]))
     elementos.append(t_btn)
 
-    resto_fotos = fotos_descargadas[2:]
+    # 7. Galería: Todas las fotos restantes una debajo de la otra (1 por fila)
+    resto_fotos = fotos_descargadas[1:]
     if resto_fotos:
         elementos.append(PageBreak())
         elementos.append(Paragraph("📸 Galería Completa de la Propiedad", section_style))
         elementos.append(Spacer(1, 10))
 
-        filas = []
-        for i in range(0, len(resto_fotos), 2):
-            if i + 1 < len(resto_fotos):
-                filas.append([resto_fotos[i], resto_fotos[i+1]])
-            else:
-                filas.append([resto_fotos[i], ""])
+        for idx, foto in enumerate(resto_fotos):
+            t_foto = Table([[foto]], colWidths=[540])
+            t_foto.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+                ('TOPPADDING', (0, 0), (-1, -1), 0),
+            ]))
+            elementos.append(t_foto)
+            elementos.append(Spacer(1, 12))
 
-        t_galeria = Table(filas, colWidths=[270, 270])
-        t_galeria.setStyle(TableStyle([
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ]))
-        elementos.append(t_galeria)
-        elementos.append(Spacer(1, 12))
+        elementos.append(Spacer(1, 6))
         elementos.append(t_btn)
 
     doc.build(elementos)
