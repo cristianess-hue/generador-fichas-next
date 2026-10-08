@@ -95,7 +95,7 @@ def extraer_datos_inmueble(url):
     return og_title, og_desc, body_text, imagenes
 
 # ==========================================
-# PROCESAMIENTO CON GEMINI
+# PROCESAMIENTO CON GEMINI (CASCADA RESILIENTE)
 # ==========================================
 
 def procesar_con_ia(url, og_title, og_desc, body_text):
@@ -130,14 +130,38 @@ def procesar_con_ia(url, og_title, og_desc, body_text):
     }}
     """
 
-    res = client.models.generate_content(
-        model='gemini-3.5-flash-lite',
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        )
-    )
-    return json.loads(res.text)
+    modelos_candidatos = [
+        'gemini-2.5-flash-lite',
+        'gemini-2.5-flash',
+        'gemini-3.5-flash-lite',
+        'gemini-3.5-flash'
+    ]
+    
+    ultimo_error = None
+
+    for modelo in modelos_candidatos:
+        for intento in range(2):
+            try:
+                res = client.models.generate_content(
+                    model=modelo,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                return json.loads(res.text)
+            except Exception as e:
+                err_str = str(e)
+                ultimo_error = e
+                # Si está sobrecargado (503) o con límite temporal, prueba el siguiente
+                if "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str:
+                    time.sleep(1.5)
+                    continue
+                # Si el modelo no existe o no está disponible, rompe el bucle interno y va al siguiente
+                if "404" in err_str:
+                    break
+
+    raise ultimo_error
 
 # ==========================================
 # RENDERIZADO DEL PDF
