@@ -45,7 +45,6 @@ def extraer_datos_inmueble(url):
     if meta_d and meta_d.get("content"):
         og_desc = meta_d["content"].strip()
 
-    # Eliminar bloques donde suele residir la tarjeta del asesor antes de extraer
     for bloque_asesor in soup.find_all(lambda tag: any(cl in str(tag.get('class', '')).lower() or cl in str(tag.get('id', '')).lower() 
                                                       for cl in ['asesor', 'agente', 'agent', 'contact-agent', 'broker', 'perfil-asesor'])):
         bloque_asesor.extract()
@@ -61,20 +60,17 @@ def extraer_datos_inmueble(url):
 
     imagenes = []
     
-    # 1. og:image solo si no es asesor ni logo
     meta_img = soup.find("meta", property="og:image")
     if meta_img and meta_img.get("content"):
         img_url = meta_img["content"]
         if "http" in img_url and not any(p in img_url.lower() for p in palabras_prohibidas):
             imagenes.append(img_url)
 
-    # 2. Etiquetas <img> del inmueble
     for img in soup.find_all("img"):
         src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or img.get("data-original") or ""
         alt = (img.get("alt") or "").lower()
         src_lower = src.lower()
         
-        # Descartar si el enlace o el alt dicen que es asesor/logo
         if not src or any(p in src_lower for p in palabras_prohibidas) or any(p in alt for p in palabras_prohibidas):
             continue
             
@@ -85,7 +81,6 @@ def extraer_datos_inmueble(url):
             if full_src not in imagenes:
                 imagenes.append(full_src)
 
-    # 3. URLs en texto crudo (sliders/carruseles)
     matches_raw = re.findall(r'https?://[^\s"\']+\.(?:jpe?g|png|webp)', resp.text, re.IGNORECASE)
     for m in matches_raw:
         m_lower = m.lower()
@@ -236,3 +231,208 @@ def generar_pdf(titulo, precio, caracteristicas, descripcion, imagenes_urls, ase
     fotos_descargadas = []
     headers = {"User-Agent": "Mozilla/5.0"}
     for url in imagenes_urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=8)
+            if r.status_code == 200:
+                img_data = io.BytesIO(r.content)
+                img = RLImage(img_data, width=265, height=170)
+                fotos_descargadas.append(img)
+        except Exception:
+            continue
+
+    # 3. Portada: Primeras 2 fotos
+    if fotos_descargadas:
+        primeras = fotos_descargadas[:2]
+        if len(primeras) == 2:
+            t_front = Table([[primeras[0], primeras[1]]], colWidths=[270, 270])
+        else:
+            t_front = Table([[primeras[0]]], colWidths=[540])
+        t_front.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 0),
+        ]))
+        elementos.append(t_front)
+        elementos.append(Spacer(1, 8))
+
+    # 4. Badges de características
+    if caracteristicas:
+        badges = [Paragraph(f"✓ {c}", badge_style) for c in caracteristicas[:4]]
+        t_badges = Table([badges], colWidths=[135] * len(badges))
+        t_badges.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f1f5f9')),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
+            ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0')),
+        ]))
+        elementos.append(t_badges)
+        elementos.append(Spacer(1, 10))
+
+    # 5. Descripción renglón por renglón
+    lineas = [l.strip() for l in descripcion.split("\n") if l.strip()]
+    for linea in lineas:
+        if linea.endswith(":") or (not linea.startswith("•") and not linea.startswith("-")):
+            elementos.append(Spacer(1, 4))
+            elementos.append(Paragraph(linea, subhead_style))
+        else:
+            texto_linea = linea if linea.startswith("•") else f"• {linea.lstrip('-* ')}"
+            elementos.append(Paragraph(texto_linea, line_item_style))
+
+    elementos.append(Spacer(1, 14))
+
+    # 6. Botón de WhatsApp
+    wa_url = f"https://wa.me/52{asesor_tel}?text=Hola%20{asesor_nom},%20me%20interesa%20esta%20propiedad:%20{titulo}"
+    btn_link = f'<a href="{wa_url}" color="white">📲 Contactar a {asesor_nom} por WhatsApp ({asesor_tel})</a>'
+    
+    t_btn = Table([[Paragraph(btn_link, wa_style)]], colWidths=[540])
+    t_btn.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#25D366')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 9),
+    ]))
+    elementos.append(t_btn)
+
+    # 7. Galería con el resto de fotos
+    resto_fotos = fotos_descargadas[2:]
+    if resto_fotos:
+        elementos.append(PageBreak())
+        elementos.append(Paragraph("📸 Galería Completa de la Propiedad", section_style))
+        elementos.append(Spacer(1, 10))
+
+        filas = []
+        for i in range(0, len(resto_fotos), 2):
+            if i + 1 < len(resto_fotos):
+                filas.append([resto_fotos[i], resto_fotos[i+1]])
+            else:
+                filas.append([resto_fotos[i], ""])
+
+        t_galeria = Table(filas, colWidths=[270, 270])
+        t_galeria.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        elementos.append(t_galeria)
+        elementos.append(Spacer(1, 12))
+        elementos.append(t_btn)
+
+    doc.build(elementos)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# ==========================================
+# INTERFAZ STREAMLIT CON SESSION STATE
+# ==========================================
+
+st.title("📄 Generador de Fichas en PDF")
+st.write("Pega hasta **5 enlaces** de Next Bienes Raíces (uno por línea):")
+
+if "fichas_generadas" not in st.session_state:
+    st.session_state.fichas_generadas = []
+if "zip_buffer" not in st.session_state:
+    st.session_state.zip_buffer = None
+
+urls_raw = st.text_area(
+    "Enlaces de las propiedades:",
+    value="https://nextbr.mx/propiedades/casa-en-renta-en-torreplata-residencial\nhttps://nextbr.mx/propiedades/local-en-renta-en-col-san-benito-34737\nhttps://nextbr.mx/propiedades/casa-en-renta-en-corceles-residencial-34739",
+    height=130
+)
+
+col1, col2 = st.columns(2)
+with col1:
+    asesor_nombre = st.text_input("Tu Nombre:", value="Cristian Sosa")
+with col2:
+    asesor_wa = st.text_input("WhatsApp (10 dígitos):", value="6622057331")
+
+st.markdown("---")
+btn_generar = st.button("🚀 Iniciar Generación de PDFs", type="primary", use_container_width=True)
+
+if btn_generar:
+    lista_urls = [u.strip() for u in urls_raw.strip().split("\n") if u.strip().startswith("http")]
+    
+    if not lista_urls:
+        st.error("Pega al menos un enlace válido.")
+    else:
+        if len(lista_urls) > 5:
+            st.warning("Se procesarán los primeros 5 enlaces.")
+            lista_urls = lista_urls[:5]
+        
+        st.session_state.fichas_generadas = []
+        st.session_state.zip_buffer = None
+
+        barra = st.progress(0)
+        total = len(lista_urls)
+
+        for idx, url in enumerate(lista_urls):
+            with st.spinner(f"Procesando {idx + 1} de {total}: {url.split('/')[-1]}..."):
+                try:
+                    og_title, og_desc, body_text, fotos = extraer_datos_inmueble(url)
+                    info = procesar_con_ia(url, og_title, og_desc, body_text)
+
+                    titulo = info.get("titulo", "Propiedad Inmobiliaria")
+                    precio = info.get("precio", "")
+                    tags = info.get("caracteristicas", [])
+                    desc_final = info.get("descripcion", "")
+                    
+                    nombre_base = info.get("nombre_archivo", titulo)
+                    nombre_limpio = re.sub(r'[\\/*?:"<>|]', "", nombre_base).strip()
+                    nombre_pdf = f"{nombre_limpio}.pdf"
+
+                    pdf_data = generar_pdf(
+                        titulo=titulo,
+                        precio=precio,
+                        caracteristicas=tags,
+                        descripcion=desc_final,
+                        imagenes_urls=fotos,
+                        asesor_nom=asesor_nombre,
+                        asesor_tel=asesor_wa
+                    )
+
+                    st.session_state.fichas_generadas.append({
+                        "nombre": nombre_pdf,
+                        "datos": pdf_data,
+                        "fotos_count": len(fotos)
+                    })
+
+                except Exception as e:
+                    st.error(f"Error en {url}: {e}")
+
+            barra.progress((idx + 1) / total)
+
+        if st.session_state.fichas_generadas:
+            zip_io = io.BytesIO()
+            with zipfile.ZipFile(zip_io, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for item in st.session_state.fichas_generadas:
+                    zf.writestr(item["nombre"], item["datos"])
+            zip_io.seek(0)
+            st.session_state.zip_buffer = zip_io.getvalue()
+            st.balloons()
+
+if st.session_state.fichas_generadas:
+    st.subheader("🎉 Fichas Listas")
+    
+    if st.session_state.zip_buffer:
+        st.download_button(
+            label="📦 Descargar TODAS las fichas en un archivo ZIP",
+            data=st.session_state.zip_buffer,
+            file_name="Fichas_Inmobiliarias.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+    st.markdown("---")
+    st.write("**O descárgalas individualmente si prefieres:**")
+    
+    for i, ficha in enumerate(st.session_state.fichas_generadas):
+        col_txt, col_btn = st.columns([3, 2])
+        with col_txt:
+            st.write(f"📄 **{ficha['nombre']}** ({ficha['fotos_count']} fotos)")
+        with col
