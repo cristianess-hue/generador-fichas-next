@@ -19,6 +19,12 @@ st.set_page_config(page_title="Generador de Fichas PDF", page_icon="📄", layou
 
 API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
+# Directorio de asesores (aquí puedes añadir más fácilmente en el futuro)
+ASESORES = {
+    "Cristian Sosa": "6622057331",
+    "Claudia Castro": "6621387957"
+}
+
 # ==========================================
 # EXTRACCIÓN ROBUSTA SIN FOTOS DE ASESORES
 # ==========================================
@@ -153,11 +159,9 @@ def procesar_con_ia(url, og_title, og_desc, body_text):
             except Exception as e:
                 err_str = str(e)
                 ultimo_error = e
-                # Si está sobrecargado (503) o con límite temporal, prueba el siguiente
                 if "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str:
                     time.sleep(1.5)
                     continue
-                # Si el modelo no existe o no está disponible, rompe el bucle interno y va al siguiente
                 if "404" in err_str:
                     break
 
@@ -361,15 +365,19 @@ if "zip_buffer" not in st.session_state:
 
 urls_raw = st.text_area(
     "Enlaces de las propiedades:",
-    value="https://nextbr.mx/propiedades/casa-en-renta-en-torreplata-residencial\nhttps://nextbr.mx/propiedades/local-en-renta-en-col-san-benito-34737\nhttps://nextbr.mx/propiedades/casa-en-renta-en-corceles-residencial-34739",
+    value="",
+    placeholder="https://nextbr.mx/propiedades/ejemplo-propiedad-1\nhttps://nextbr.mx/propiedades/ejemplo-propiedad-2",
     height=130
 )
 
 col1, col2 = st.columns(2)
 with col1:
-    asesor_nombre = st.text_input("Tu Nombre:", value="Cristian Sosa")
+    asesor_nombre = st.selectbox("Selecciona tu Nombre:", options=list(ASESORES.keys()), index=0)
+
+telefono_asignado = ASESORES.get(asesor_nombre, "")
+
 with col2:
-    asesor_wa = st.text_input("WhatsApp (10 dígitos):", value="6622057331")
+    asesor_wa = st.text_input("WhatsApp (10 dígitos):", value=telefono_asignado, disabled=True)
 
 st.markdown("---")
 btn_generar = st.button("🚀 Iniciar Generación de PDFs", type="primary", use_container_width=True)
@@ -415,7 +423,7 @@ if btn_generar:
                             descripcion=desc_final,
                             imagenes_urls=fotos,
                             asesor_nom=asesor_nombre,
-                            asesor_tel=asesor_wa
+                            asesor_tel=telefono_asignado
                         )
 
                         st.session_state.fichas_generadas.append({
