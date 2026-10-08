@@ -16,7 +16,10 @@ from reportlab.lib import colors
 # DEBE IR ANTES QUE CUALQUIER OTRA COSA EN STREAMLIT
 st.set_page_config(page_title="Generador de Fichas PDF", page_icon="📄", layout="centered")
 
-API_KEY = "AIzaSyB649Va4ULl13t4Lmsj7kbI2oD014V9DNA"
+import os
+
+# Lee la clave desde Streamlit Secrets o variables de entorno de forma segura
+API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
 # ==========================================
 # EXTRACCIÓN ROBUSTA SIN FOTOS DE ASESORES
