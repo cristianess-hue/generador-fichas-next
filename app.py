@@ -15,14 +15,12 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+from reportlab.pdfgen import canvas
 
 st.set_page_config(page_title="Generador de Fichas PDF", page_icon="📄", layout="centered")
 
 API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
-# ==========================================
-# DIRECTORIO DE ASESORES Y MARCA
-# ==========================================
 LOGO_NEXT_PATH = "logo_next.png"
 
 ASESORES = {
@@ -34,20 +32,19 @@ ASESORES = {
     "Claudia Castro": {
         "telefono": "6621387957",
         "foto": "claudia_castro.jpg",
-        "lema": "Tu tranquilidad es nuestra prioridad: nos encargamos de todo."
+        "lema": "Conectamos personas con los espacios que sueñan."
     }
 }
 
 # ==========================================
-# EXTRACCIÓN ROBUSTA SIN FOTOS DE ASESORES
+# EXTRACCIÓN Y SCRAPING
 # ==========================================
 
 def extraer_datos_inmueble(url):
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
+        "Accept-Language": "es-ES,es;q=0.9"
     }
     
     resp = session.get(url, headers=headers, timeout=20)
@@ -67,21 +64,17 @@ def extraer_datos_inmueble(url):
     if meta_d and meta_d.get("content"):
         og_desc = meta_d["content"].strip()
 
-    for bloque_asesor in soup.find_all(lambda tag: any(cl in str(tag.get('class', '')).lower() or cl in str(tag.get('id', '')).lower() 
-                                                      for cl in ['asesor', 'agente', 'agent', 'contact-agent', 'broker', 'perfil-asesor'])):
-        bloque_asesor.extract()
+    for bloque in soup.find_all(lambda t: any(cl in str(t.get('class', '')).lower() or cl in str(t.get('id', '')).lower() 
+                                            for cl in ['asesor', 'agente', 'agent', 'broker', 'perfil-asesor'])):
+        bloque.extract()
 
-    for script in soup(["script", "style", "noscript"]):
-        script.extract()
+    for s in soup(["script", "style", "noscript"]):
+        s.extract()
     body_text = soup.get_text(separator="\n", strip=True)
 
-    palabras_prohibidas = [
-        "asesor", "agente", "agent", "staff", "perfil", "profile", 
-        "team", "realtor", "logo", "avatar", "icon", "user", "banner", "face"
-    ]
-
+    palabras_prohibidas = ["asesor", "agente", "agent", "staff", "perfil", "team", "logo", "avatar", "icon", "user"]
     imagenes = []
-    
+
     meta_img = soup.find("meta", property="og:image")
     if meta_img and meta_img.get("content"):
         img_url = meta_img["content"]
@@ -89,14 +82,11 @@ def extraer_datos_inmueble(url):
             imagenes.append(img_url)
 
     for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or img.get("data-original") or ""
+        src = img.get("src") or img.get("data-src") or ""
         alt = (img.get("alt") or "").lower()
-        src_lower = src.lower()
-        
-        if not src or any(p in src_lower for p in palabras_prohibidas) or any(p in alt for p in palabras_prohibidas):
+        if not src or any(p in src.lower() for p in palabras_prohibidas) or any(p in alt for p in palabras_prohibidas):
             continue
-            
-        if any(term in src_lower for term in ["uploads", "listings", "propiedades", "images", "media"]):
+        if any(term in src.lower() for term in ["uploads", "listings", "propiedades", "images"]):
             full_src = re.sub(r'-[0-9]+x[0-9]+', '', src)
             if not full_src.startswith("http"):
                 full_src = f"https://nextbr.mx{full_src}"
@@ -111,51 +101,60 @@ def extraer_datos_inmueble(url):
             if clean_m not in imagenes:
                 imagenes.append(clean_m)
 
-    return og_title, og_desc, body_text, imagenes
+    # Extraer ID / Folio de la URL si existe
+    folio_match = re.search(r'-(\d{4,6})$', url.rstrip('/'))
+    folio = folio_match.group(1) if folio_match else "S/F"
+
+    return og_title, og_desc, body_text, imagenes, folio
 
 # ==========================================
-# PROCESAMIENTO CON GEMINI (CASCADA RESILIENTE)
+# ESTRUCTURACIÓN CON IA (CATEGORIZADA Y SIN ALUCINACIONES)
 # ==========================================
 
 def procesar_con_ia(url, og_title, og_desc, body_text):
     client = genai.Client(api_key=API_KEY)
     
     prompt = f"""
-    Eres un analista inmobiliario profesional.
-    Extrae la información de la propiedad analizada a partir de los siguientes datos:
-
+    Eres un analista inmobiliario profesional. Extrae la información verificable de la propiedad:
     URL: {url}
     Título Meta: {og_title}
     Descripción Meta: {og_desc}
-    Texto de la página:
-    {body_text[:6000]}
+    Texto:
+    {body_text[:6500]}
 
-    INSTRUCCIONES ESTRICTAS:
-    1. 'nombre_archivo': EXACTAMENTE con la estructura "[Tipo] en [Colonia/Residencial] [Precio]" (Ejemplo: "Casa en Corceles Residencial $17,000" o "Local en Col San Benito $8,500"). Quita cualquier caracter ilegal como / \\ : * ? " < > |.
-    2. 'titulo': Nombre formal de la propiedad.
-    3. 'precio': Precio formateado con moneda (ej. $17,000 MXN).
-    4. 'caracteristicas': Array de hasta 4 puntos clave (ej. ["3 Recámaras", "2 Baños", "180 m² Construcción", "Cochera 2 autos"]).
-    5. 'descripcion': ESTRUCTURADA RENGLÓN POR RENGLÓN con viñetas (•).
-       - Cada área, recámara, amenidad y equipamiento en una línea separada.
-       - Elimina cualquier número telefónico ajeno o nombre de otras empresas.
+    REGLAS ESTRICTAS (CERO ALUCINACIONES):
+    1. 'titulo': Título formal en MAYÚSCULAS o Capitalizado.
+    2. 'precio': Formato con moneda (ej. $3,580,000.00 MXN).
+    3. 'caracteristicas': Array con EXACTAMENTE estos datos si existen en el texto:
+       - Recámaras (ej: "3 Recámaras")
+       - Baños (ej: "2.5 Baños")
+       - Terreno (ej: "148 m² Terreno")
+       - Construcción (ej: "192 m² Construcción")
+    4. 'estatus_legal': Si el texto dice "libre de gravamen", pon "Libre de Gravamen". Si no dice nada, déjalo vacío "".
+    5. 'secciones': Separa la descripción en las secciones que apliquen:
+       - "distribucion_pb": lista de amenidades de Planta Baja (sin inventar).
+       - "distribucion_pa": lista de amenidades de Planta Alta (sin inventar).
+       - "equipamiento": lista de equipamiento (ej. Minisplits, Paneles solares, Cocina integral, etc.).
+       - "area_comun": amenidades de la privada o residencial (parque, alberca, canchas, etc.).
+    6. 'nombre_archivo': Estructura "[Tipo] en [Colonia] [Precio]" sin caracteres ilegales.
 
-    Devuelve un JSON estrictamente válido:
+    Responde en JSON estrictamente:
     {{
-      "titulo": "Título",
-      "precio": "$00,000 MXN",
+      "titulo": "...",
+      "precio": "...",
       "caracteristicas": ["..."],
-      "descripcion": "• ...\\n• ...",
-      "nombre_archivo": "Casa en Colonia $00,000"
+      "estatus_legal": "...",
+      "secciones": {{
+        "distribucion_pb": ["..."],
+        "distribucion_pa": ["..."],
+        "equipamiento": ["..."],
+        "area_comun": ["..."]
+      }},
+      "nombre_archivo": "..."
     }}
     """
 
-    modelos_candidatos = [
-        'gemini-2.5-flash-lite',
-        'gemini-2.5-flash',
-        'gemini-3.5-flash-lite',
-        'gemini-3.5-flash'
-    ]
-    
+    modelos_candidatos = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3.5-flash-lite']
     ultimo_error = None
 
     for modelo in modelos_candidatos:
@@ -164,169 +163,134 @@ def procesar_con_ia(url, og_title, og_desc, body_text):
                 res = client.models.generate_content(
                     model=modelo,
                     contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
+                    config=types.GenerateContentConfig(response_mime_type="application/json")
                 )
                 return json.loads(res.text)
             except Exception as e:
-                err_str = str(e)
                 ultimo_error = e
-                if "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str:
-                    time.sleep(1.5)
-                    continue
-                if "404" in err_str:
-                    break
+                time.sleep(1.5)
+                continue
 
     raise ultimo_error
 
 # ==========================================
-# ESCALADO DE IMÁGENES PROPORCIONAL
+# CÁLCULO EXACTO DE PRECIO POR M²
 # ==========================================
 
-def procesar_imagen_proporcional(fuente, max_w=540, max_h=320, es_local=False):
+def calcular_precio_m2(precio_str, caracteristicas_list):
+    try:
+        precio_num = float(re.sub(r'[^\d.]', '', precio_str))
+        m2_const = None
+        for c in caracteristicas_list:
+            if "construcci" in c.lower() or "const" in c.lower():
+                m = re.search(r'(\d+(?:\.\d+)?)', c)
+                if m:
+                    m2_const = float(m.group(1))
+                    break
+        if m2_const and m2_const > 0 and precio_num > 50000:  # Solo para venta o valores reales
+            pm2 = precio_num / m2_const
+            return f"${pm2:,.0f} MXN/m²"
+    except Exception:
+        pass
+    return None
+
+# ==========================================
+# ESCALADO DE IMÁGENES
+# ==========================================
+
+def procesar_imagen_proporcional(fuente, max_w=540, max_h=300, es_local=False):
     try:
         if es_local:
             if not os.path.exists(fuente):
                 return None
-            with PILImage.open(fuente) as pil_img:
-                orig_w, orig_h = pil_img.size
-            if orig_w == 0 or orig_h == 0:
-                return None
-            ratio = min(max_w / orig_w, max_h / orig_h)
-            return RLImage(fuente, width=orig_w * ratio, height=orig_h * ratio)
+            with PILImage.open(fuente) as p_img:
+                w, h = p_img.size
+            ratio = min(max_w / w, max_h / h)
+            return RLImage(fuente, width=w * ratio, height=h * ratio)
         else:
             headers = {"User-Agent": "Mozilla/5.0"}
             r = requests.get(fuente, headers=headers, timeout=8)
             if r.status_code == 200:
-                img_bytes = io.BytesIO(r.content)
-                with PILImage.open(img_bytes) as pil_img:
-                    orig_w, orig_h = pil_img.size
-                if orig_w == 0 or orig_h == 0:
-                    return None
-                ratio = min(max_w / orig_w, max_h / orig_h)
-                img_bytes.seek(0)
-                return RLImage(img_bytes, width=orig_w * ratio, height=orig_h * ratio)
+                b = io.BytesIO(r.content)
+                with PILImage.open(b) as p_img:
+                    w, h = p_img.size
+                ratio = min(max_w / w, max_h / h)
+                b.seek(0)
+                return RLImage(b, width=w * ratio, height=h * ratio)
     except Exception:
         return None
     return None
 
 # ==========================================
-# RENDERIZADO DEL PDF ELEGANTE
+# NUMERACIÓN DE PÁGINA (CANVAS NUMERADO)
 # ==========================================
 
-def generar_pdf(titulo, precio, caracteristicas, descripcion, imagenes_urls, asesor_nom, asesor_info):
+class NumberedCanvas(canvas.Canvas):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        num_pages = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self.draw_footer(num_pages)
+            super().showPage()
+        super().save()
+
+    def draw_footer(self, page_count):
+        self.saveState()
+        self.setFont("Helvetica", 8)
+        self.setFillColor(colors.HexColor("#94a3b8"))
+        # Pie de página elegante a 18 puntos del fondo
+        texto_pag = f"Página {self._pageNumber} de {page_count}"
+        self.drawRightString(576, 18, texto_pag)
+        self.drawString(36, 18, "Next Bienes Raíces • Ficha Técnica de Propiedad")
+        self.restoreState()
+
+# ==========================================
+# RENDERIZADO DEL PDF PREMIUM
+# ==========================================
+
+def generar_pdf(info, imagenes_urls, asesor_nom, asesor_info, folio):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
         rightMargin=36,
         leftMargin=36,
-        topMargin=28,
-        bottomMargin=28
+        topMargin=26,
+        bottomMargin=34
     )
 
     styles = getSampleStyleSheet()
+
+    lema_style = ParagraphStyle('H_Lema', parent=styles['Normal'], fontName='Helvetica-Oblique', fontSize=8, leading=10, textColor=colors.HexColor('#64748b'))
+    asesor_h = ParagraphStyle('H_Asesor', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=10, leading=12, textColor=colors.HexColor('#0f172a'), alignment=2)
+    asesor_s = ParagraphStyle('H_Tel', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8.5, leading=11, textColor=colors.HexColor('#0284c7'), alignment=2)
     
-    lema_style = ParagraphStyle(
-        'HeaderSlogan',
-        parent=styles['Normal'],
-        fontName='Helvetica-Oblique',
-        fontSize=8.5,
-        leading=11,
-        textColor=colors.HexColor('#64748b')
-    )
-
-    asesor_header_style = ParagraphStyle(
-        'HeaderAsesor',
-        parent=styles['Normal'],
-        fontName='Helvetica-Bold',
-        fontSize=10,
-        leading=13,
-        textColor=colors.HexColor('#0f172a'),
-        alignment=2
-    )
-
-    asesor_sub_style = ParagraphStyle(
-        'HeaderAsesorSub',
-        parent=styles['Normal'],
-        fontName='Helvetica',
-        fontSize=8.5,
-        leading=11,
-        textColor=colors.HexColor('#0284c7'),
-        alignment=2
-    )
-
-    title_style = ParagraphStyle(
-        'PropTitle',
-        parent=styles['Heading1'],
-        fontName='Helvetica-Bold',
-        fontSize=16,
-        leading=20,
-        textColor=colors.HexColor('#0f172a')
-    )
+    title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=15, leading=18, textColor=colors.HexColor('#0f172a'))
+    price_style = ParagraphStyle('Price', parent=styles['Heading2'], fontName='Helvetica-Bold', fontSize=16, leading=19, textColor=colors.HexColor('#0284c7'))
+    folio_style = ParagraphStyle('Folio', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=9, leading=12, textColor=colors.HexColor('#64748b'), alignment=2)
     
-    price_style = ParagraphStyle(
-        'PropPrice',
-        parent=styles['Heading2'],
-        fontName='Helvetica-Bold',
-        fontSize=17,
-        leading=21,
-        textColor=colors.HexColor('#0284c7')
-    )
+    badge_style = ParagraphStyle('Badge', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=colors.HexColor('#0f172a'), alignment=1)
+    legal_style = ParagraphStyle('Legal', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8.5, leading=11, textColor=colors.HexColor('#166534'), alignment=1)
     
-    line_item_style = ParagraphStyle(
-        'PropLineItem',
-        parent=styles['Normal'],
-        fontName='Helvetica',
-        fontSize=9,
-        leading=13.5,
-        textColor=colors.HexColor('#334155')
-    )
-
-    subhead_style = ParagraphStyle(
-        'PropSubHead',
-        parent=styles['Normal'],
-        fontName='Helvetica-Bold',
-        fontSize=9.5,
-        leading=14,
-        textColor=colors.HexColor('#0f172a')
-    )
-
-    badge_style = ParagraphStyle(
-        'PropBadge',
-        parent=styles['Normal'],
-        fontName='Helvetica-Bold',
-        fontSize=8.5,
-        leading=11,
-        textColor=colors.HexColor('#0f172a'),
-        alignment=1
-    )
-
-    wa_style = ParagraphStyle(
-        'PropWA',
-        parent=styles['Normal'],
-        fontName='Helvetica-Bold',
-        fontSize=11,
-        leading=14,
-        textColor=colors.HexColor('#ffffff'),
-        alignment=1
-    )
-
-    section_style = ParagraphStyle(
-        'SectionHeader',
-        parent=styles['Heading2'],
-        fontName='Helvetica-Bold',
-        fontSize=12,
-        leading=16,
-        textColor=colors.HexColor('#0f172a')
-    )
+    subhead_style = ParagraphStyle('Subhead', parent=styles['Heading3'], fontName='Helvetica-Bold', fontSize=9.5, leading=13, textColor=colors.HexColor('#0f172a'))
+    item_style = ParagraphStyle('Item', parent=styles['Normal'], fontName='Helvetica', fontSize=8.5, leading=12, textColor=colors.HexColor('#334155'))
+    
+    wa_style = ParagraphStyle('WA', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=10.5, leading=13, textColor=colors.HexColor('#ffffff'), alignment=1)
+    sec_title_style = ParagraphStyle('SecTitle', parent=styles['Heading2'], fontName='Helvetica-Bold', fontSize=12, leading=15, textColor=colors.HexColor('#0f172a'))
 
     elementos = []
 
-    # 1. ENCABEZADO CON LOGO, LEMA Y ASESOR
-    logo_img = procesar_imagen_proporcional(LOGO_NEXT_PATH, max_w=140, max_h=45, es_local=True)
-    foto_asesor_img = procesar_imagen_proporcional(asesor_info.get("foto", ""), max_w=45, max_h=45, es_local=True)
+    # 1. ENCABEZADO
+    logo_img = procesar_imagen_proporcional(LOGO_NEXT_PATH, max_w=130, max_h=40, es_local=True)
+    foto_asesor_img = procesar_imagen_proporcional(asesor_info.get("foto", ""), max_w=42, max_h=42, es_local=True)
 
     bloque_logo = []
     if logo_img:
@@ -335,127 +299,157 @@ def generar_pdf(titulo, precio, caracteristicas, descripcion, imagenes_urls, ase
     bloque_logo.append(Paragraph(asesor_info.get("lema", ""), lema_style))
 
     bloque_asesor = [
-        Paragraph(asesor_nom, asesor_header_style),
-        Paragraph(f"📲 {asesor_info.get('telefono', '')}", asesor_sub_style),
+        Paragraph(asesor_nom, asesor_h),
+        Paragraph(f"📲 {asesor_info.get('telefono', '')}", asesor_s),
         Paragraph("Asesor Inmobiliario Asociado", lema_style)
     ]
 
     fila_header = [bloque_logo, bloque_asesor]
-    col_widths_header = [380, 160]
-
+    col_widths = [380, 160]
     if foto_asesor_img:
         fila_header = [bloque_logo, bloque_asesor, foto_asesor_img]
-        col_widths_header = [340, 150, 50]
+        col_widths = [340, 150, 50]
 
-    t_header = Table([fila_header], colWidths=col_widths_header)
+    t_header = Table([fila_header], colWidths=col_widths)
     t_header.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('TOPPADDING', (0, 0), (-1, -1), 0),
         ('LINEBELOW', (0, 0), (-1, -1), 1, colors.HexColor('#e2e8f0')),
     ]))
     elementos.append(t_header)
-    elementos.append(Spacer(1, 8))
+    elementos.append(Spacer(1, 6))
 
-    # 2. TÍTULO Y PRECIO
-    elementos.append(Paragraph(titulo, title_style))
-    elementos.append(Spacer(1, 3))
-    if precio:
-        elementos.append(Paragraph(precio, price_style))
-    elementos.append(Spacer(1, 8))
+    # 2. TÍTULO, PRECIO Y FOLIO
+    elementos.append(Paragraph(info.get("titulo", "Propiedad en Venta"), title_style))
+    elementos.append(Spacer(1, 2))
 
-    # 3. FOTO PRINCIPAL
-    fotos_descargadas = []
+    t_precio_folio = Table([
+        [Paragraph(info.get("precio", ""), price_style), Paragraph(f"ID / Folio: #{folio}", folio_style)]
+    ], colWidths=[380, 160])
+    t_precio_folio.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+        ('TOPPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    elementos.append(t_precio_folio)
+    elementos.append(Spacer(1, 6))
+
+    # 3. FOTO DE PORTADA
+    fotos_desc = []
     for u in imagenes_urls:
-        rl_img = procesar_imagen_proporcional(u, max_w=540, max_h=290, es_local=False)
-        if rl_img:
-            fotos_descargadas.append(rl_img)
+        im = procesar_imagen_proporcional(u, max_w=540, max_h=260, es_local=False)
+        if im:
+            fotos_desc.append(im)
 
-    if fotos_descargadas:
-        foto_portada = fotos_descargadas[0]
-        t_front = Table([[foto_portada]], colWidths=[540])
+    if fotos_desc:
+        t_front = Table([[fotos_desc[0]]], colWidths=[540])
         t_front.setStyle(TableStyle([
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
             ('TOPPADDING', (0, 0), (-1, -1), 0),
         ]))
         elementos.append(t_front)
-        elementos.append(Spacer(1, 8))
+        elementos.append(Spacer(1, 6))
 
-    # 4. CARACTERÍSTICAS CLAVE
-    if caracteristicas:
-        badges = [Paragraph(f"✓ {c}", badge_style) for c in caracteristicas[:4]]
-        t_badges = Table([badges], colWidths=[135] * len(badges))
+    # 4. CARACTERÍSTICAS TÉCNICAS + CÁLCULO DE M²
+    caracts = list(info.get("caracteristicas", []))
+    pm2 = calcular_precio_m2(info.get("precio", ""), caracts)
+    if pm2:
+        caracts.append(pm2)
+
+    if caracts:
+        badges = [Paragraph(f"✓ {c}", badge_style) for c in caracts[:5]]
+        ancho_col = 540 / len(badges)
+        t_badges = Table([badges], colWidths=[ancho_col] * len(badges))
         t_badges.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f8fafc')),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('TOPPADDING', (0, 0), (-1, -1), 5),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
             ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
             ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0')),
         ]))
         elementos.append(t_badges)
-        elementos.append(Spacer(1, 9))
+        elementos.append(Spacer(1, 6))
 
-    # 5. DESCRIPCIÓN ESTRUCTURADA
-    lineas = [l.strip() for l in descripcion.split("\n") if l.strip()]
-    for linea in lineas:
-        if linea.endswith(":") or (not linea.startswith("•") and not linea.startswith("-")):
+    # 5. ESTATUS JURÍDICO DESTACADO
+    if info.get("estatus_legal"):
+        t_legal = Table([[Paragraph(f"🛡️ Estatus Jurídico: {info['estatus_legal']} • Acepta créditos bancarios y recursos propios", legal_style)]], colWidths=[540])
+        t_legal.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#dcfce7')),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#86efac')),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        elementos.append(t_legal)
+        elementos.append(Spacer(1, 6))
+
+    # 6. DISTRIBUCIÓN Y EQUIPAMIENTO CATEGORIZADOS
+    sec = info.get("secciones", {})
+    bloques_desc = [
+        ("🔹 Planta Baja:", sec.get("distribucion_pb", [])),
+        ("🔹 Planta Alta:", sec.get("distribucion_pa", [])),
+        ("⚡ Equipamiento Incluido:", sec.get("equipamiento", [])),
+        ("🌳 Privada y Áreas Comunes:", sec.get("area_comun", []))
+    ]
+
+    for titulo_sec, items in bloques_desc:
+        if items:
+            elementos.append(Paragraph(titulo_sec, subhead_style))
+            texto_linea = " • ".join(items)
+            elementos.append(Paragraph(f"• {texto_linea}", item_style))
             elementos.append(Spacer(1, 3))
-            elementos.append(Paragraph(linea, subhead_style))
-        else:
-            texto_linea = linea if linea.startswith("•") else f"• {linea.lstrip('-* ')}"
-            elementos.append(Paragraph(texto_linea, line_item_style))
 
-    elementos.append(Spacer(1, 12))
+    elementos.append(Spacer(1, 6))
 
-    # 6. BOTÓN DE CONTACTO WHATSAPP
-    asesor_tel = asesor_info.get("telefono", "")
-    wa_url = f"https://wa.me/52{asesor_tel}?text=Hola%20{asesor_nom},%20me%20interesa%20esta%20propiedad:%20{titulo}"
-    btn_link = f'<a href="{wa_url}" color="white">📲 Contactar a {asesor_nom} por WhatsApp ({asesor_tel})</a>'
-    
-    t_btn = Table([[Paragraph(btn_link, wa_style)]], colWidths=[540])
+    # 7. BOTÓN WHATSAPP DE PORTADA
+    wa_num = asesor_info.get("telefono", "")
+    wa_url = f"https://wa.me/52{wa_num}?text=Hola%20{asesor_nom},%20me%20interesa%20la%20propiedad:%20{info.get('titulo', '')}%20(Folio:%20{folio})"
+    btn_markup = f'<a href="{wa_url}" color="white">📲 Contactar a {asesor_nom} por WhatsApp ({wa_num})</a>'
+
+    t_btn = Table([[Paragraph(btn_markup, wa_style)]], colWidths=[540])
     t_btn.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#25D366')),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 7),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
     ]))
     elementos.append(t_btn)
 
-    # 7. GALERÍA DE FOTOS (1 POR FILA)
-    resto_fotos = fotos_descargadas[1:]
+    # 8. GALERÍA DE FOTOS (1 POR FILA)
+    resto_fotos = fotos_desc[1:]
     if resto_fotos:
         elementos.append(PageBreak())
-        elementos.append(Paragraph("📸 Galería de la Propiedad", section_style))
+        elementos.append(Paragraph("📸 Galería Fotográfica de la Propiedad", sec_title_style))
         elementos.append(Spacer(1, 8))
 
-        for foto in resto_fotos:
-            t_foto = Table([[foto]], colWidths=[540])
-            t_foto.setStyle(TableStyle([
+        for f in resto_fotos:
+            t_f = Table([[f]], colWidths=[540])
+            t_f.setStyle(TableStyle([
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
                 ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
                 ('TOPPADDING', (0, 0), (-1, -1), 0),
             ]))
-            elementos.append(t_foto)
-            elementos.append(Spacer(1, 12))
+            elementos.append(t_f)
+            elementos.append(Spacer(1, 10))
 
-        elementos.append(Spacer(1, 6))
+        elementos.append(Spacer(1, 4))
         elementos.append(t_btn)
 
-    doc.build(elementos)
+    doc.build(elementos, canvasmaker=NumberedCanvas)
     buffer.seek(0)
     return buffer.getvalue()
 
 # ==========================================
-# INTERFAZ STREAMLIT
+# INTERFAZ WEB STREAMLIT
 # ==========================================
 
-st.title("📄 Generador de Fichas en PDF")
+st.title("📄 Generador de Fichas PDF Premium")
 st.write("Pega hasta **5 enlaces** de Next Bienes Raíces (uno por línea):")
 
 if "fichas_generadas" not in st.session_state:
@@ -466,8 +460,8 @@ if "zip_buffer" not in st.session_state:
 urls_raw = st.text_area(
     "Enlaces de las propiedades:",
     value="",
-    placeholder="https://nextbr.mx/propiedades/ejemplo-propiedad-1\nhttps://nextbr.mx/propiedades/ejemplo-propiedad-2",
-    height=120
+    placeholder="https://nextbr.mx/propiedades/casa-en-venta-en-montecarlo-residencial-34759",
+    height=110
 )
 
 col1, col2 = st.columns(2)
@@ -489,14 +483,13 @@ if btn_generar:
         st.error("No se detectó la clave GEMINI_API_KEY en Streamlit Secrets.")
     else:
         lista_urls = [u.strip() for u in urls_raw.strip().split("\n") if u.strip().startswith("http")]
-        
         if not lista_urls:
             st.error("Pega al menos un enlace válido.")
         else:
             if len(lista_urls) > 5:
                 st.warning("Se procesarán los primeros 5 enlaces.")
                 lista_urls = lista_urls[:5]
-            
+
             st.session_state.fichas_generadas = []
             st.session_state.zip_buffer = None
 
@@ -506,26 +499,19 @@ if btn_generar:
             for idx, url in enumerate(lista_urls):
                 with st.spinner(f"Procesando {idx + 1} de {total}: {url.split('/')[-1]}..."):
                     try:
-                        og_title, og_desc, body_text, fotos = extraer_datos_inmueble(url)
+                        og_title, og_desc, body_text, fotos, folio = extraer_datos_inmueble(url)
                         info = procesar_con_ia(url, og_title, og_desc, body_text)
 
-                        titulo = info.get("titulo", "Propiedad Inmobiliaria")
-                        precio = info.get("precio", "")
-                        tags = info.get("caracteristicas", [])
-                        desc_final = info.get("descripcion", "")
-                        
-                        nombre_base = info.get("nombre_archivo", titulo)
+                        nombre_base = info.get("nombre_archivo", info.get("titulo", "Propiedad"))
                         nombre_limpio = re.sub(r'[\\/*?:"<>|]', "", nombre_base).strip()
                         nombre_pdf = f"{nombre_limpio}.pdf"
 
                         pdf_data = generar_pdf(
-                            titulo=titulo,
-                            precio=precio,
-                            caracteristicas=tags,
-                            descripcion=desc_final,
+                            info=info,
                             imagenes_urls=fotos,
                             asesor_nom=asesor_nombre,
-                            asesor_info=info_asesor
+                            asesor_info=info_asesor,
+                            folio=folio
                         )
 
                         st.session_state.fichas_generadas.append({
@@ -533,9 +519,8 @@ if btn_generar:
                             "datos": pdf_data,
                             "fotos_count": len(fotos)
                         })
-
                     except Exception as e:
-                        st.error(f"Error en {url}: {e}")
+                        st.error(f"Error procesando {url}: {e}")
 
                 barra.progress((idx + 1) / total)
 
@@ -550,20 +535,17 @@ if btn_generar:
 
 if st.session_state.fichas_generadas:
     st.subheader("🎉 Fichas Listas")
-    
     if st.session_state.zip_buffer:
         st.download_button(
             label="📦 Descargar TODAS las fichas en un archivo ZIP",
             data=st.session_state.zip_buffer,
-            file_name="Fichas_Inmobiliarias.zip",
+            file_name="Fichas_Next_Inmobiliarias.zip",
             mime="application/zip",
             type="primary",
             use_container_width=True
         )
 
     st.markdown("---")
-    st.write("**O descárgalas individualmente si prefieres:**")
-    
     for i, ficha in enumerate(st.session_state.fichas_generadas):
         col_txt, col_btn = st.columns([3, 2])
         with col_txt:
@@ -574,6 +556,6 @@ if st.session_state.fichas_generadas:
                 data=ficha["datos"],
                 file_name=ficha["nombre"],
                 mime="application/pdf",
-                key=f"dl_persist_{i}",
+                key=f"dl_f_{i}",
                 use_container_width=True
             )
